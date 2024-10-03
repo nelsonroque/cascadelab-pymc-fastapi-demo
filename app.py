@@ -5,7 +5,7 @@ import numpy as np
 from io import StringIO
 import time
 
-app = FastAPI()
+app = FastAPI(title="M2C2 Bayesian models in the cloud!")
 
 @app.post("/run-model/")
 async def run_model(file: UploadFile = File(...)):
