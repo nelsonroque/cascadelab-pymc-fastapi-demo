@@ -20,4 +20,4 @@ pip install -r requirements.txt
 
 # Run FastAPI app
 echo "Starting FastAPI app..."
-uvicorn app:app --reload
+uvicorn appz:app --reload
