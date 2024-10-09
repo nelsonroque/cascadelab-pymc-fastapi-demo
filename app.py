@@ -1,164 +1,122 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-import pandas as pd
-import pymc as pm
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
 import numpy as np
-from io import StringIO
+import pymc as pm
+import pandas as pd
+import arviz as az
+import math
 import time
 
-app = FastAPI(title="M2C2 Bayesian models in the cloud!")
+app = FastAPI()
 
-# GET ALL THIS
-# posterior probabilities (form credible intervals/HDI from the distribution of paramter esitmaes) = measure of certainty
-# get priors even if defaults (necessary for papers)
-# get the trace plot - 
-# probably both the trace plot and the posterior plot
-# rhat values
-# divergences
-# elapsed time
-#how many samples, how many chains, how many iterations
-# optioon to change iterations
-# 4 chains, 2000 iterations; override for mlm
-# effective sample size for the tail and the body
-# power in bayseins is weird
- 
-@app.post("/run-model/sample/100/chains/19/iterations/1000")
-async def run_model(file: UploadFile = File(...)):
-    
-    # start a timer
-    start = time.time()
-    
-    # Check if uploaded file is CSV
-    if file.content_type != 'text/csv':
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
-    
-    # Read CSV file
-    contents = await file.read()
-    csv_data = StringIO(contents.decode("utf-8"))
-    data = pd.read_csv(csv_data)
+# Define the input model for API
+class ModelInput(BaseModel):
+    num_participants: int = 300  # The number of participants
+    days_per_person: int = 14  # The number of days for each person
 
-    # Ensure the CSV has 'x' and 'y' columns
-    if 'x' not in data.columns or 'y' not in data.columns:
-        raise HTTPException(status_code=400, detail="CSV must have 'x' and 'y' columns for this model.")
+# Step 1: Simulate data generation process
+def generate_synthetic_data(P: int, days_per_person: int):
+    # Set the random seed for reproducibility
+    np.random.seed(42)
 
-    x = data['x'].values
-    y = data['y'].values
+    N = P * days_per_person  # total number of datapoints
 
-    # PyMC Bayesian Linear Regression model
+    # Create dayIndex: repeated measurements for each person
+    dayIndex = np.tile(np.arange(0, days_per_person), P)
+
+    # Create nrAssess: number of assessments for each day
+    nrAssess = np.random.randint(1, 6, size=N)
+
+    # Create personIndex: person identifiers
+    personIndex = np.repeat(np.arange(P), days_per_person)
+
+    # True parameters
+    true_murC = 0.5
+    true_mugC = 2.0
+    true_muA = 1.0
+    true_muSdE = 0.2
+
+    true_rCSd = 0.1
+    true_gCSd = 0.5
+    true_aSd = 0.3
+    true_sdESd = 0.1
+
+    # Generate person-specific true parameters from the hyperpriors
+    true_rC = np.abs(np.random.normal(true_murC, true_rCSd, P))
+    true_gC = np.abs(np.random.normal(true_mugC, true_gCSd, P))
+    true_a = np.abs(np.random.normal(true_muA, true_aSd, P))
+    true_sdE = np.abs(np.random.normal(true_muSdE, true_sdESd, P))
+
+    # Simulate RT data based on the true parameters
+    RT = np.zeros(N)
+    for n in range(N):
+        person = personIndex[n]
+        RT[n] = np.random.normal(
+            true_a[person] + true_gC[person] * np.exp(-true_rC[person] * dayIndex[n]),
+            true_sdE[person] / math.sqrt(nrAssess[n])
+        )
+
+    return RT, personIndex, dayIndex, nrAssess, P
+
+# Step 2: PyMC Model
+def run_pymc_model(RT, personIndex, dayIndex, nrAssess, P):
+    start_time = time.time()
+
     with pm.Model() as model:
-        # Priors for unknown model parameters
-        alpha = pm.Normal("alpha", mu=0, sigma=10)
-        beta = pm.Normal("beta", mu=0, sigma=10)
-        sigma = pm.HalfNormal("sigma", sigma=1)
 
-        # Expected value of outcome
-        mu = alpha + beta * x
+        # Hyperpriors
+        murC = pm.HalfNormal("murC", sigma=1)
+        mugC = pm.HalfNormal("mugC", sigma=1)
+        muA = pm.HalfNormal("muA", sigma=1)
+        muSdE = pm.HalfNormal("muSdE", sigma=1)
 
-        # Likelihood (sampling distribution) of observations
-        y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
+        rCSd = pm.HalfNormal("rCSd", sigma=1)
+        gCSd = pm.HalfNormal("gCSd", sigma=1)
+        aSd = pm.HalfNormal("aSd", sigma=1)
+        sdESd = pm.HalfNormal("sdESd", sigma=1)
 
-        # Inference
-        trace = pm.sample(1000, return_inferencedata=True)
+        # Person-specific parameters
+        rC = pm.TruncatedNormal("rC", mu=murC, sigma=rCSd, lower=0, shape=P)
+        gC = pm.TruncatedNormal("gC", mu=mugC, sigma=gCSd, lower=0, shape=P)
+        a = pm.TruncatedNormal("a", mu=muA, sigma=aSd, lower=0, shape=P)
+        sdE = pm.TruncatedNormal("sdE", mu=muSdE, sigma=sdESd, lower=0, shape=P)
 
-    summary = pm.summary(trace)
-    
-    elapsed_time = time.time() - start
-    
-    output_data = summary.to_dict()
-    output_data['elapsed_time'] = elapsed_time
-    
-    # extract info on divergences
-    divergences = trace.sample_stats["diverging"]
-    print(divergences) # count booleans in list of lists
+        # Likelihood
+        RT_obs = pm.Normal(
+            "RT_obs",
+            mu=a[personIndex] + gC[personIndex] * pm.math.exp(-rC[personIndex] * dayIndex),
+            sigma=sdE[personIndex] / np.sqrt(nrAssess),
+            observed=RT
+        )
 
-    return output_data
+        # Sampling
+        trace = pm.sample(draws=2000, chains=2, cores=2, return_inferencedata=True, random_seed=123)
 
-@app.post("/run-model/mlm")
-async def run_model(file: UploadFile = File(...)):
-    
-    # possible change the priors 
-    # scale the priors to the data
-    # truncated normal distribution (for Rt, gamma, etc)
-    # change the link function to be normal, categorical
-    # trunbcating outcome
-       
-    # start a timer
-    start = time.time()
-    
-    # Check if uploaded file is CSV
-    if file.content_type != 'text/csv':
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
-    
-    # Read CSV file
-    contents = await file.read()
-    csv_data = StringIO(contents.decode("utf-8"))
-    data = pd.read_csv(csv_data)
+    # End time for execution
+    end_time = time.time()
+    time_diff = (end_time - start_time) / 60
+    print(f"Time taken: {time_diff:.2f} minutes")
 
-    # Ensure the CSV has 'x', 'y', and 'group' columns
-    if 'x' not in data.columns or 'y' not in data.columns or 'group' not in data.columns:
-        raise HTTPException(status_code=400, detail="CSV must have 'x', 'y', and 'group' columns for this multilevel model.")
+    # Return the summary of the trace
+    summary = az.summary(trace)
+    return summary
 
-    x = data['x'].values
-    y = data['y'].values
-    group = data['group'].values
+# Step 3: Run the model in the background
+def run_model_in_background(num_participants: int, days_per_person: int):
+    # Step 1: Generate synthetic data
+    RT, personIndex, dayIndex, nrAssess, P = generate_synthetic_data(num_participants, days_per_person)
 
-    # Number of unique groups
-    n_groups = len(np.unique(group))
-    
-    # PyMC Multilevel Bayesian Linear Regression model
-    with pm.Model() as model:
-        # Hyperpriors for group-level distributions
-        mu_alpha = pm.Normal("mu_alpha", mu=0, sigma=10)
-        mu_beta = pm.Normal("mu_beta", mu=0, sigma=10)
-        sigma_alpha = pm.HalfNormal("sigma_alpha", sigma=1)
-        sigma_beta = pm.HalfNormal("sigma_beta", sigma=1)
-        
-        # Group-specific intercepts and slopes
-        alpha = pm.Normal("alpha", mu=mu_alpha, sigma=sigma_alpha, shape=n_groups)
-        beta = pm.Normal("beta", mu=mu_beta, sigma=sigma_beta, shape=n_groups)
+    # Step 2: Run the PyMC model
+    summary = run_pymc_model(RT, personIndex, dayIndex, nrAssess, P)
 
-        # Priors for the error term
-        sigma = pm.HalfNormal("sigma", sigma=1)
+    # Print or save the result
+    summary_df = summary.reset_index().rename(columns={'index': 'parameter'})
+    summary_df.to_csv('resulttable.csv', index=False)
+    print("Model run completed and results saved to resulttable.csv")
 
-        # Group-specific intercepts and slopes for each observation
-        alpha_group = alpha[group]
-        beta_group = beta[group]
-
-        # Expected value of outcome
-        mu = alpha_group + beta_group * x
-
-        # Likelihood (sampling distribution) of observations
-        y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
-
-        # Inference
-        trace = pm.sample(1000, return_inferencedata=True)
-
-    # Summarize the results
-    summary = pm.summary(trace)
-    
-    # Calculate elapsed time
-    elapsed_time = time.time() - start
-    
-    # Convert the summary to a dictionary
-    output_data = summary.to_dict()
-    output_data['elapsed_time'] = elapsed_time
-    
-    # Extract info on divergences
-    divergences = trace.sample_stats["diverging"].sum().item()  # count the number of divergences
-    output_data['divergences'] = divergences
-    
-    # trace plot data
-    # trace_data = pm.trace_to_dataframe(trace)
-    # output_data['trace_data'] = trace_data.to_dict()
-    
-    # rhat values
-    # want them between 1.0 and 1.01 #Mthe lower the better
-    rhat_values = pm.rhat(trace)
-    output_data['rhat_values'] = rhat_values.to_dict()
-    
-    # posterior distribution data
-    # posterior_data = pm.posterior_to_xarray(trace)
-    # output_data['posterior_data'] = posterior_data.to_dict()
-
-    return output_data
-
-# pymc, vs pystan vs tensorflow probability vs pybrms, vs bambi (syntax, lme4)
+# FastAPI endpoint to trigger the model run
+@app.post("/run-model/")
+async def run_model(input_data: ModelInput, background_tasks: BackgroundTasks):
+    # Add the model run to the background tasks
+    background_tasks.add_task(run_model_in_background, input_data.num_participants, input_data.days_per_person)
+    return {"message": "Model run started in the background"}
